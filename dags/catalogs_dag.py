@@ -1,14 +1,14 @@
 import logging
 from datetime import datetime, timedelta
-from typing import List, Tuple
 
 from airflow.decorators import dag, task
 from airflow.operators.python import get_current_context
-from airflow.models import Variable
-from airflow.providers.http.hooks.http import HttpHook
 import pandas as pd
-from plugins.io.postgres_catalog_client import sync_table, truncate_table, update_is_active_field
-from plugins.io.postgres_analytics_client import insert_data
+
+from etl.clients.api_client import APIClient
+from etl.clients.postgres_client import PostgresClient
+from plugins.io.api_hook import APIHook
+from plugins.io.postgres_hook import PostgresHook
 
 
 default_args = {
@@ -42,20 +42,6 @@ recipe_accordance = {
 }
 
 
-def get_catalog_data(data_type: str) -> dict:
-    """
-    data_type - categories, dishes, products, recipes
-    """
-    endpoint = f"/data/get-{data_type}"
-    hook = HttpHook(method="GET", http_conn_id="1C_api")
-    logging.info(f"Fetching up-to-date data from 1C API: {endpoint}")
-    response = hook.run(endpoint)
-    logging.info(f"Статус: {response.status_code}")
-    response_data = response.json()
-    logging.info(f"Всего: {len(response_data[data_type])} данных")
-    return response_data[data_type]
-
-
 @dag(
     default_args=default_args,
     start_date=datetime(2025, 9, 7),
@@ -63,8 +49,14 @@ def get_catalog_data(data_type: str) -> dict:
     catchup=False
 )
 def sync_catalogs_dag():
+    api_hook = APIHook(conn_id="1C_api")
+    api_client: APIClient = api_hook.get_client()
+
+    postgres_hook = PostgresHook("postgres_conn")
+    postgres_client: PostgresClient = postgres_hook.get_client()
+
     @task(execution_timeout=timedelta(seconds=60))
-    def extract_up_to_date_catalogs_data():
+    def extract_up_to_date_catalogs_data() -> dict:
         catalog_data = {
             "categories": None,
             "dishes": None,
@@ -72,10 +64,10 @@ def sync_catalogs_dag():
             "recipes": None,
         }
         
-        catalog_data["categories"] =  get_catalog_data("categories")
-        catalog_data["dishes"] =  get_catalog_data("dishes")
-        catalog_data["products"] =  get_catalog_data("products")
-        catalog_data["recipes"] =  get_catalog_data("recipes")
+        catalog_data["categories"] =  api_client.get_categories_data()
+        catalog_data["dishes"] =  api_client.get_dishes_data()
+        catalog_data["products"] =  api_client.get_products_data()
+        catalog_data["recipes"] =  api_client.get_recipes_data()
     
         return catalog_data
         
@@ -87,22 +79,22 @@ def sync_catalogs_dag():
         logging.info(catalog_data)
         return catalog_data
     
-    @task()
+    @task(execution_timeout=timedelta(seconds=60)) # TODO: при тестовых данных
     def update_catalog_tables(catalog_data: dict) -> None:
         logging.info("Start updating")
-        sync_table("category", catalog_data["categories"], category_accordance, "external_uuid")
+        postgres_client.sync_table("category", catalog_data["categories"], category_accordance, "external_uuid")
         logging.info("Category table has been succesfully synchronized")
-        sync_table("dish", catalog_data["dishes"], dish_accordance, "external_uuid", category_fk=True)
-        update_is_active_field(catalog_data["dishes"], dish_accordance)
+        postgres_client.sync_table("dish", catalog_data["dishes"], dish_accordance, "external_uuid", category_fk=True)
+        postgres_client.update_is_active_field(catalog_data["dishes"], dish_accordance)
         logging.info("Dish table has been succesfully synchronized")
-        sync_table("product", catalog_data["products"], product_accordance, "external_uuid", category_fk=True)
+        postgres_client.sync_table("product", catalog_data["products"], product_accordance, "external_uuid", category_fk=True)
         ### TODO: подразумеваю, что у продуктов не будут удаляться записи, поэтому не использую поле is_active
         logging.info("Product table has been succesfully synchronized")
 
-        truncate_table("recipe")
+        postgres_client.truncate_table("recipe")
         recipe_df = pd.DataFrame(catalog_data["recipes"])
         recipe_df.rename(columns=recipe_accordance, inplace=True)
-        insert_data(
+        postgres_client.insert_analytic_data(
             data_df=recipe_df, 
             table_name="recipe", 
             fk_on=["dish", "product"]
